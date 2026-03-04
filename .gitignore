@@ -6,6 +6,8 @@
 *.dylib
 *.a
 /ipsw
+/caches
+/headers
 
 # Test binary, build with `go test -c`
 *.test

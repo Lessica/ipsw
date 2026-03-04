@@ -524,14 +524,20 @@ func (o *ObjC) Headers() error {
 			}
 			slices.Sort(props)
 			slices.Sort(setters)
-			// remove ivars that are properties
-			class.Ivars = slices.DeleteFunc(class.Ivars, func(i objc.Ivar) bool {
-				// return slices.Contains(props, i.Name) || slices.Contains(props, strings.TrimPrefix(i.Name, "_")) TODO: use this instead
-				return slices.Contains(props, strings.TrimPrefix(i.Name, "_"))
+			slices.SortStableFunc(class.Ivars, func(a, b objc.Ivar) int {
+				return cmp.Compare(a.Name, b.Name)
 			})
-			// remove methods that are property getter/setter
-			class.InstanceMethods = slices.DeleteFunc(class.InstanceMethods, func(m objc.Method) bool {
-				return slices.Contains(props, m.Name) || slices.Contains(setters, m.Name)
+			slices.SortStableFunc(class.Props, func(a, b objc.Property) int {
+				return cmp.Compare(a.Name, b.Name)
+			})
+			slices.SortStableFunc(class.ClassMethods, func(a, b objc.Method) int {
+				return cmp.Compare(a.Name, b.Name)
+			})
+			slices.SortStableFunc(class.InstanceMethods, func(a, b objc.Method) int {
+				return cmp.Compare(a.Name, b.Name)
+			})
+			slices.SortStableFunc(class.Protocols, func(a, b objc.Protocol) int {
+				return cmp.Compare(a.Name, b.Name)
 			})
 			fname := filepath.Join(o.conf.Output, o.conf.Name, class.Name+".h")
 			if err := writeHeader(&headerInfo{
@@ -574,12 +580,23 @@ func (o *ObjC) Headers() error {
 				}
 				slices.Sort(props)
 				slices.Sort(setters)
-				// remove methods that are property getter/setter
-				proto.InstanceMethods = slices.DeleteFunc(proto.InstanceMethods, func(m objc.Method) bool {
-					return slices.Contains(props, m.Name) || slices.Contains(setters, m.Name)
+				slices.SortStableFunc(proto.ClassMethods, func(a, b objc.Method) int {
+					return cmp.Compare(a.Name, b.Name)
 				})
-				proto.OptionalInstanceMethods = slices.DeleteFunc(proto.OptionalInstanceMethods, func(m objc.Method) bool {
-					return slices.Contains(props, m.Name) || slices.Contains(setters, m.Name)
+				slices.SortStableFunc(proto.InstanceMethods, func(a, b objc.Method) int {
+					return cmp.Compare(a.Name, b.Name)
+				})
+				slices.SortStableFunc(proto.ClassProperties, func(a, b objc.Property) int {
+					return cmp.Compare(a.Name, b.Name)
+				})
+				slices.SortStableFunc(proto.InstanceProperties, func(a, b objc.Property) int {
+					return cmp.Compare(a.Name, b.Name)
+				})
+				slices.SortStableFunc(proto.OptionalClassMethods, func(a, b objc.Method) int {
+					return cmp.Compare(a.Name, b.Name)
+				})
+				slices.SortStableFunc(proto.OptionalInstanceMethods, func(a, b objc.Method) int {
+					return cmp.Compare(a.Name, b.Name)
 				})
 				fname := filepath.Join(o.conf.Output, o.conf.Name, proto.Name+"-Protocol.h")
 				if err := writeHeader(&headerInfo{
@@ -619,6 +636,18 @@ func (o *ObjC) Headers() error {
 			} else {
 				name = cat.Name
 			}
+			slices.SortStableFunc(cat.ClassMethods, func(a, b objc.Method) int {
+				return cmp.Compare(a.Name, b.Name)
+			})
+			slices.SortStableFunc(cat.InstanceMethods, func(a, b objc.Method) int {
+				return cmp.Compare(a.Name, b.Name)
+			})
+			slices.SortStableFunc(cat.Properties, func(a, b objc.Property) int {
+				return cmp.Compare(a.Name, b.Name)
+			})
+			slices.SortStableFunc(cat.Protocols, func(a, b objc.Protocol) int {
+				return cmp.Compare(a.Name, b.Name)
+			})
 			if err := writeHeader(&headerInfo{
 				FileName:      fname,
 				IpswVersion:   o.conf.IpswVersion,
@@ -891,7 +920,7 @@ func writeHeader(hdr *headerInfo) error {
 			"//\n"+
 			"//    - LC_BUILD_VERSION:  %s\n"+
 			"//    - LC_SOURCE_VERSION: %s\n"+
-			"//\n"+
+			"//\n\n"+
 			"#ifndef %s_h\n"+
 			"#define %s_h\n",
 		hdr.IpswVersion,
