@@ -664,12 +664,10 @@ func (o *ObjC) Headers() error {
 
 		/* generate umbrella header */
 		if len(headers) > 0 {
-			var umbrella string
-			if slices.Contains(headers, o.conf.Name+".h") {
-				umbrella = o.conf.Name + "-Umbrella"
-			} else {
-				umbrella = o.conf.Name
-			}
+			var umbrella = o.conf.Name + "-Umbrella"
+			slices.SortStableFunc(headers, func(a, b string) int {
+				return cmp.Compare(a, b)
+			})
 
 			for i, header := range headers {
 				headers[i] = "#import \"" + header + "\""
