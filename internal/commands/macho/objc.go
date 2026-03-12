@@ -54,6 +54,24 @@ type Imports struct {
 	Protos  []string
 }
 
+func dedupeKeepLastByKey[T any](items []T, key func(T) string) []T {
+	if len(items) < 2 {
+		return items
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]T, 0, len(items))
+	for i := len(items) - 1; i >= 0; i-- {
+		k := key(items[i])
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, items[i])
+	}
+	slices.Reverse(out)
+	return out
+}
+
 func (i *Imports) uniq(foundation map[string][]string) {
 	slices.Sort(i.Imports)
 	slices.Sort(i.Locals)
@@ -524,6 +542,11 @@ func (o *ObjC) Headers() error {
 			}
 			slices.Sort(props)
 			slices.Sort(setters)
+			class.Ivars = dedupeKeepLastByKey(class.Ivars, func(ivar objc.Ivar) string { return ivar.Name })
+			class.Props = dedupeKeepLastByKey(class.Props, func(prop objc.Property) string { return prop.Name })
+			class.ClassMethods = dedupeKeepLastByKey(class.ClassMethods, func(method objc.Method) string { return method.Name })
+			class.InstanceMethods = dedupeKeepLastByKey(class.InstanceMethods, func(method objc.Method) string { return method.Name })
+			class.Protocols = dedupeKeepLastByKey(class.Protocols, func(proto objc.Protocol) string { return proto.Name })
 			slices.SortStableFunc(class.Ivars, func(a, b objc.Ivar) int {
 				return cmp.Compare(a.Name, b.Name)
 			})
@@ -580,6 +603,12 @@ func (o *ObjC) Headers() error {
 				}
 				slices.Sort(props)
 				slices.Sort(setters)
+				proto.ClassMethods = dedupeKeepLastByKey(proto.ClassMethods, func(method objc.Method) string { return method.Name })
+				proto.InstanceMethods = dedupeKeepLastByKey(proto.InstanceMethods, func(method objc.Method) string { return method.Name })
+				proto.ClassProperties = dedupeKeepLastByKey(proto.ClassProperties, func(prop objc.Property) string { return prop.Name })
+				proto.InstanceProperties = dedupeKeepLastByKey(proto.InstanceProperties, func(prop objc.Property) string { return prop.Name })
+				proto.OptionalClassMethods = dedupeKeepLastByKey(proto.OptionalClassMethods, func(method objc.Method) string { return method.Name })
+				proto.OptionalInstanceMethods = dedupeKeepLastByKey(proto.OptionalInstanceMethods, func(method objc.Method) string { return method.Name })
 				slices.SortStableFunc(proto.ClassMethods, func(a, b objc.Method) int {
 					return cmp.Compare(a.Name, b.Name)
 				})
@@ -636,6 +665,10 @@ func (o *ObjC) Headers() error {
 			} else {
 				name = cat.Name
 			}
+			cat.ClassMethods = dedupeKeepLastByKey(cat.ClassMethods, func(method objc.Method) string { return method.Name })
+			cat.InstanceMethods = dedupeKeepLastByKey(cat.InstanceMethods, func(method objc.Method) string { return method.Name })
+			cat.Properties = dedupeKeepLastByKey(cat.Properties, func(prop objc.Property) string { return prop.Name })
+			cat.Protocols = dedupeKeepLastByKey(cat.Protocols, func(proto objc.Protocol) string { return proto.Name })
 			slices.SortStableFunc(cat.ClassMethods, func(a, b objc.Method) int {
 				return cmp.Compare(a.Name, b.Name)
 			})
