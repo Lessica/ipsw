@@ -4,6 +4,7 @@ package extract
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/aes"
 	"encoding/hex"
 	"encoding/json"
@@ -34,6 +35,7 @@ import (
 	"github.com/blacktop/ipsw/pkg/kernelcache"
 	"github.com/blacktop/ipsw/pkg/ota"
 	"github.com/blacktop/ipsw/pkg/plist"
+	"github.com/dustin/go-humanize"
 )
 
 var ErrNoDecryptionKey = errors.New("no decryption key found")
@@ -96,6 +98,27 @@ type Config struct {
 	FirmwareKeys download.WikiFWKeys `json:"-"`
 	// BuildManifest identity selector (used for rdisk)
 	Ident string `json:"ident,omitempty"`
+	// Build is the OTA buildID (used to name the on-disk AEA partial so
+	// `ipsw download appledb` / `download ota` can resume it).
+	Build string `json:"build,omitempty"`
+	// Version is the OTA version string (paired with Build for naming).
+	Version string `json:"version,omitempty"`
+	// RemoveCommas matches the `--remove-commas` download flag for naming.
+	RemoveCommas bool `json:"remove_commas,omitempty"`
+	// FwType is the firmware type ("ota", "rsr", "ipsw") used in the
+	// download appledb naming scheme.
+	FwType string `json:"fw_type,omitempty"`
+	// AnyKernel matches any kernelcache.* variant (release / development /
+	// research). Default is to match only kernelcache.release.*.
+	AnyKernel bool `json:"any_kernel,omitempty"`
+	// AEADestName, if set, overrides the on-disk filename used for the
+	// streamed AEA partial. The path is treated as relative to Output.
+	// Use this when the caller wants the partial to follow a non-default
+	// naming scheme (e.g. `download ota` NORMAL MODE layout).
+	AEADestName string `json:"aea_dest_name,omitempty"`
+	// AEAResumeCommand, if set, overrides the copy-pasteable command shown
+	// to the user after a partial AEA OTA is saved.
+	AEAResumeCommand string `json:"aea_resume_command,omitempty"`
 
 	info     *info.Info
 	wikiKeys download.WikiFWKeys
@@ -505,6 +528,19 @@ func Kernelcache(c *Config) (map[string][]string, error) {
 		if !isURL(c.URL) {
 			return nil, fmt.Errorf("invalid URL provided: %s", c.URL)
 		}
+		// Detect AEA-encrypted OTA payload and stream-decrypt directly.
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		isAEA, err := download.IsRemoteAEA(ctx, c.URL, &download.RemoteConfig{
+			Proxy:    c.Proxy,
+			Insecure: c.Insecure,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to probe remote URL: %v", err)
+		}
+		if isAEA {
+			return streamRemoteAEAKernelcache(ctx, cancel, c)
+		}
 		i, zr, folder, err := getRemoteFolder(c)
 		if err != nil {
 			return nil, err
@@ -643,6 +679,424 @@ func selectRemoteKernelcacheMembers(i *info.Info, files []*zip.File, destPath, d
 	}
 
 	return selected, nil
+}
+
+// countingReadCloser wraps an io.ReadCloser, tracks how many bytes have been
+// read from the underlying reader, and optionally tees the bytes to a writer
+// (used to persist the encrypted AEA prefix on disk for later resume). Safe
+// for sequential single-reader access (the goroutine driving
+// aea.DecryptStream).
+type countingReadCloser struct {
+	rc io.ReadCloser
+	// tee receives every byte we successfully read from rc, except for
+	// the first teeSkipBytes that are already on disk (used when
+	// concatenating a resumed prefix with a fresh HTTP body).
+	tee          io.Writer
+	teeSkipBytes int64
+	n            int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.rc.Read(p)
+	if n > 0 && c.tee != nil {
+		off := 0
+		if c.teeSkipBytes > 0 {
+			if int64(n) <= c.teeSkipBytes {
+				c.teeSkipBytes -= int64(n)
+				off = n
+			} else {
+				off = int(c.teeSkipBytes)
+				c.teeSkipBytes = 0
+			}
+		}
+		if off < n {
+			// Best-effort: a tee write failure must not abort the decrypt
+			// pipeline; just stop teeing further bytes.
+			if _, werr := c.tee.Write(p[off:n]); werr != nil {
+				c.tee = nil
+			}
+		}
+	}
+	c.n += int64(n)
+	return n, err
+}
+
+func (c *countingReadCloser) Close() error { return c.rc.Close() }
+func (c *countingReadCloser) Count() int64 { return c.n }
+
+// streamRemoteAEAKernelcache pulls an AEA-encrypted OTA from c.URL via a
+// single streaming HTTP GET, decrypts it on the fly, scans the inner YAA
+// stream for the first kernelcache.* entry, and writes the parsed +
+// decompressed kernelcache to c.Output. The HTTP body is cancelled as soon
+// as the kernelcache is captured, so only the prefix of the OTA up to that
+// entry is actually transferred.
+func streamRemoteAEAKernelcache(ctx context.Context, cancelHTTP context.CancelFunc, c *Config) (map[string][]string, error) {
+	outDir := filepath.Clean(c.Output)
+	if err := os.MkdirAll(outDir, 0o750); err != nil {
+		return nil, fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	// Build an on-disk filename that matches what `ipsw download appledb`
+	// would write for the same OTA, so the encrypted bytes we tee can be
+	// resumed by the standard downloader (which appends `.download` to its
+	// DestName when looking for resumable transfers).
+	aeaName := buildAEADestName(c)
+	aeaPath := filepath.Join(outDir, aeaName)
+	partialPath := aeaPath + ".download"
+
+	// If a previous run already left a complete AEA on disk, decrypt it
+	// locally instead of re-downloading.
+	if fi, err := os.Stat(aeaPath); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+		log.WithFields(log.Fields{
+			"path": aeaPath,
+			"size": humanize.Bytes(uint64(fi.Size())),
+		}).Info("Reusing local AEA OTA")
+		f, err := os.Open(aeaPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open local AEA %s: %v", aeaPath, err)
+		}
+		defer f.Close()
+		return streamAEAKernelcache(ctx, cancelHTTP, c, &countingReadCloser{rc: f}, fi.Size(), outDir, "", aeaPath, fi.Size())
+	}
+
+	// If a previous run wrote a `.download` partial, resume from where it
+	// stopped: read the cached prefix from disk first, then continue with
+	// an HTTP Range request and tee additional bytes back into the same
+	// file. This lets `--kernel` reuse the work done by either an earlier
+	// `--kernel` invocation or an interrupted `ipsw download` resume.
+	var resumeOffset int64
+	if fi, err := os.Stat(partialPath); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+		resumeOffset = fi.Size()
+	}
+
+	if resumeOffset > 0 {
+		return resumeRemoteAEAKernelcache(ctx, cancelHTTP, c, outDir, partialPath, aeaPath, resumeOffset)
+	}
+
+	body, size, err := download.OpenRemoteStream(ctx, c.URL, &download.RemoteConfig{
+		Proxy:    c.Proxy,
+		Insecure: c.Insecure,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to open remote AEA stream: %v", err)
+	}
+	defer body.Close()
+
+	if size > 0 {
+		log.WithField("size", humanize.Bytes(uint64(size))).Info("Streaming remote AEA OTA")
+	} else {
+		log.Info("Streaming remote AEA OTA")
+	}
+
+	// Tee the encrypted body into <destName>.download so the
+	// already-transferred bytes survive a cancel/error and can be resumed
+	// later by the standard `ipsw download` resume-all logic. We don't
+	// write directly to the final name so that a complete file (which the
+	// local-reuse path above keys on) is never confused with a truncated
+	// one.
+	var (
+		teeFile     *os.File
+		teeWriter   io.Writer
+		teePathInfo string
+	)
+	if err := os.MkdirAll(filepath.Dir(partialPath), 0755); err != nil {
+		log.WithError(err).WithField("path", partialPath).Warn("Could not create directory for partial AEA file; bytes will not be persisted")
+	} else if f, err := os.Create(partialPath); err != nil {
+		log.WithError(err).WithField("path", partialPath).Warn("Could not open partial AEA file; bytes will not be persisted")
+	} else {
+		teeFile = f
+		teeWriter = f
+		teePathInfo = partialPath
+		defer func() { _ = teeFile.Close() }()
+	}
+
+	counter := &countingReadCloser{rc: body, tee: teeWriter}
+	return streamAEAKernelcache(ctx, cancelHTTP, c, counter, size, outDir, teePathInfo, aeaPath, 0)
+}
+
+// resumeRemoteAEAKernelcache continues an interrupted streaming AEA
+// download. It reads the on-disk `.download` prefix first, then issues a
+// Range request to fetch the remainder, teeing newly-received bytes into
+// the same file (in append mode). If the server does not honour Range
+// requests, it falls back to a fresh GET that overwrites the partial.
+func resumeRemoteAEAKernelcache(
+	ctx context.Context,
+	cancelHTTP context.CancelFunc,
+	c *Config,
+	outDir, partialPath, aeaPath string,
+	resumeOffset int64,
+) (map[string][]string, error) {
+	body, _, totalSize, err := download.OpenRemoteStreamAt(ctx, c.URL, resumeOffset, &download.RemoteConfig{
+		Proxy:    c.Proxy,
+		Insecure: c.Insecure,
+	})
+	if err != nil {
+		log.WithError(err).Warn("Could not resume AEA download; restarting from scratch")
+		// Fall through to a fresh download by removing the partial.
+		_ = os.Remove(partialPath)
+		body, size, err := download.OpenRemoteStream(ctx, c.URL, &download.RemoteConfig{
+			Proxy:    c.Proxy,
+			Insecure: c.Insecure,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to open remote AEA stream: %v", err)
+		}
+		defer body.Close()
+		if size > 0 {
+			log.WithField("size", humanize.Bytes(uint64(size))).Info("Streaming remote AEA OTA")
+		} else {
+			log.Info("Streaming remote AEA OTA")
+		}
+		teeFile, err := os.Create(partialPath)
+		if err != nil {
+			log.WithError(err).WithField("path", partialPath).Warn("Could not open partial AEA file; bytes will not be persisted")
+			counter := &countingReadCloser{rc: body}
+			return streamAEAKernelcache(ctx, cancelHTTP, c, counter, size, outDir, "", aeaPath, 0)
+		}
+		defer func() { _ = teeFile.Close() }()
+		counter := &countingReadCloser{rc: body, tee: teeFile}
+		return streamAEAKernelcache(ctx, cancelHTTP, c, counter, size, outDir, partialPath, aeaPath, 0)
+	}
+	defer body.Close()
+
+	if totalSize > 0 {
+		log.WithFields(log.Fields{
+			"size":      humanize.Bytes(uint64(totalSize)),
+			"resume":    humanize.Bytes(uint64(resumeOffset)),
+			"remaining": humanize.Bytes(uint64(totalSize - resumeOffset)),
+		}).Info("Resuming remote AEA OTA")
+	} else {
+		log.WithField("resume", humanize.Bytes(uint64(resumeOffset))).Info("Resuming remote AEA OTA")
+	}
+
+	prefix, err := os.Open(partialPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open partial AEA %s: %v", partialPath, err)
+	}
+	defer prefix.Close()
+
+	// Append teed bytes to the same partial file.
+	teeFile, err := os.OpenFile(partialPath, os.O_WRONLY|os.O_APPEND, 0o660)
+	if err != nil {
+		log.WithError(err).WithField("path", partialPath).Warn("Could not append to partial AEA file; bytes will not be persisted")
+	} else {
+		defer func() { _ = teeFile.Close() }()
+	}
+
+	combined := io.MultiReader(prefix, body)
+	counter := &countingReadCloser{
+		rc:           &readCloserShim{r: combined, c: body},
+		tee:          teeFile,
+		teeSkipBytes: resumeOffset, // the prefix bytes are already on disk
+		n:            0,
+	}
+	return streamAEAKernelcache(ctx, cancelHTTP, c, counter, totalSize, outDir, partialPath, aeaPath, resumeOffset)
+}
+
+// readCloserShim adapts an io.Reader (e.g. an io.MultiReader) into an
+// io.ReadCloser whose Close defers to the underlying network stream so that
+// cancelling the HTTP request still works.
+type readCloserShim struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (s *readCloserShim) Read(p []byte) (int, error) { return s.r.Read(p) }
+func (s *readCloserShim) Close() error               { return s.c.Close() }
+
+// buildAEADestName replicates the OTA naming used by `ipsw download appledb`
+// so the streamed `.download` partial is recognised as a resumable transfer
+// when the user later re-runs the same command without `--kernel`.
+//
+// If c.AEADestName is set the caller has supplied an explicit name (relative
+// to Output) and it is used verbatim.
+func buildAEADestName(c *Config) string {
+	if c.AEADestName != "" {
+		return c.AEADestName
+	}
+	base := filepath.Base(c.URL)
+	if c.RemoveCommas {
+		base = strings.ReplaceAll(base, ",", "_")
+	}
+	if u, err := url.Parse(c.URL); err == nil {
+		if b := filepath.Base(u.Path); b != "" && b != "/" && b != "." {
+			base = b
+			if c.RemoveCommas {
+				base = strings.ReplaceAll(base, ",", "_")
+			}
+		}
+	}
+	if c.FwType == "" && c.Build == "" && c.Version == "" && c.KernelDevice == "" {
+		return base
+	}
+	var details string
+	if c.Version != "" {
+		details += c.Version + "_"
+	}
+	if c.Build != "" {
+		details += c.Build + "_"
+	}
+	if c.KernelDevice != "" {
+		details += c.KernelDevice + "_"
+	}
+	fwType := c.FwType
+	if fwType == "" {
+		fwType = "ota"
+	}
+	details += strings.ToUpper(fwType) + "_"
+	return details + base
+}
+
+// streamAEAKernelcache drives the shared decrypt + YAA-scan + kernelcache
+// pipeline against any AEA reader (remote stream or local file).
+//
+// partialPath, when non-empty, is the on-disk file that the AEA bytes are
+// being teed into; finalPath is its destination name once the full
+// container has been transferred. prefixBytes is the number of bytes the
+// counter will read from a local prefix (e.g. an existing `.download`
+// file) before the network stream starts; it is subtracted from the
+// `transferred` log field so it reflects only newly transferred bytes.
+func streamAEAKernelcache(
+	ctx context.Context,
+	cancelHTTP context.CancelFunc,
+	c *Config,
+	counter *countingReadCloser,
+	size int64,
+	outDir string,
+	partialPath string,
+	finalPath string,
+	prefixBytes int64,
+) (map[string][]string, error) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+
+	streamCfg := &aea.StreamConfig{
+		B64SymKey: c.AEAKey,
+		PemDB:     c.PemDB,
+		Proxy:     c.Proxy,
+		Insecure:  c.Insecure,
+	}
+
+	decryptErrCh := make(chan error, 1)
+	go func() {
+		err := aea.DecryptStream(ctx, counter, pw, streamCfg)
+		decryptErrCh <- err
+		_ = pw.CloseWithError(err)
+	}()
+
+	var buf bytes.Buffer
+	matcher := ota.IsKernelcacheEntry
+	if c.AnyKernel {
+		matcher = ota.IsAnyKernelcacheEntry
+	}
+	matched, scanErr := ota.StreamFindEntry(ctx, pr, matcher, &buf)
+	// Stop downloading / decrypting as soon as we have the kernelcache.
+	cancelHTTP()
+	transferred := counter.Count()
+	netTransferred := transferred - prefixBytes
+	if netTransferred < 0 {
+		netTransferred = 0
+	}
+	// Drain decryption error (don't return on canceled-context, that's expected).
+	select {
+	case derr := <-decryptErrCh:
+		if scanErr != nil && derr != nil && !errors.Is(derr, context.Canceled) && !errors.Is(derr, io.ErrClosedPipe) {
+			return nil, fmt.Errorf("AEA decrypt failed: %v", derr)
+		}
+	default:
+	}
+	if scanErr != nil {
+		if errors.Is(scanErr, ota.ErrEntryNotFound) {
+			return nil, fmt.Errorf("kernelcache not found in OTA stream")
+		}
+		return nil, fmt.Errorf("failed to locate kernelcache in OTA stream: %v", scanErr)
+	}
+
+	logFields := log.Fields{"transferred": humanize.Bytes(uint64(netTransferred))}
+	if prefixBytes > 0 {
+		logFields["resumed_from"] = humanize.Bytes(uint64(prefixBytes))
+	}
+	if size > 0 {
+		logFields["of_total"] = humanize.Bytes(uint64(size))
+		logFields["pct"] = fmt.Sprintf("%.2f%%", float64(transferred)*100/float64(size))
+	}
+	log.WithFields(logFields).Info("Stopped remote download")
+
+	// Report (and finalize) the persisted AEA file. If we happen to have
+	// transferred the entire container, drop the .download suffix so the
+	// next invocation can short-circuit via the local-reuse path.
+	if partialPath != "" {
+		complete := size > 0 && transferred >= size
+		if complete && finalPath != "" && finalPath != partialPath {
+			if err := os.Rename(partialPath, finalPath); err == nil {
+				partialPath = finalPath
+			}
+		}
+		if fi, err := os.Stat(partialPath); err == nil {
+			fields := log.Fields{
+				"path": partialPath,
+				"size": humanize.Bytes(uint64(fi.Size())),
+			}
+			if complete {
+				log.WithFields(fields).Info("Saved full AEA OTA")
+			} else {
+				log.WithFields(fields).Info("Saved partial AEA OTA for resume")
+				log.Info("To resume the rest of the OTA download, run:")
+				utils.Indent(log.Info, 2)(aeaResumeHint(c, outDir))
+			}
+		}
+	}
+
+	cc, err := kernelcache.ParseImg4Data(buf.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse kernelcache im4p: %v", err)
+	}
+	dec, err := kernelcache.DecompressData(cc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decompress kernelcache: %v", err)
+	}
+
+	fname := filepath.Join(outDir, filepath.Base(matched.Path))
+	if err := os.WriteFile(fname, dec, 0o660); err != nil {
+		return nil, fmt.Errorf("failed to write kernelcache %s: %v", fname, err)
+	}
+
+	artifacts := map[string][]string{fname: nil}
+	if c.KernelDevice != "" {
+		artifacts[fname] = []string{c.KernelDevice}
+	}
+	return artifacts, nil
+}
+
+// aeaResumeHint returns a copy-pasteable command the user can run to finish
+// downloading the full OTA on top of the just-saved `.download` partial.
+func aeaResumeHint(c *Config, outDir string) string {
+	if c.AEAResumeCommand != "" {
+		return c.AEAResumeCommand
+	}
+	if c.Build == "" || c.KernelDevice == "" {
+		// Without enough metadata for `ipsw download appledb` to find the
+		// same source, fall back to a generic curl resume hint.
+		return fmt.Sprintf("curl -L -C - %q -o %q", c.URL, filepath.Join(outDir, buildAEADestName(c)+".download"))
+	}
+	fwType := c.FwType
+	if fwType == "" {
+		fwType = "ota"
+	}
+	parts := []string{
+		"ipsw download appledb",
+		fmt.Sprintf("--type %s", fwType),
+		fmt.Sprintf("--device %q", c.KernelDevice),
+		fmt.Sprintf("--build %q", c.Build),
+		"--os iOS",
+		fmt.Sprintf("--output %q", outDir),
+		"--resume-all",
+		"-y",
+	}
+	if c.RemoveCommas {
+		parts = append(parts, "--remove-commas")
+	}
+	return strings.Join(parts, " ")
 }
 
 // SPTM extracts the SPTM firmware from an IPSW

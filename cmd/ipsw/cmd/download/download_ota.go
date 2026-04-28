@@ -85,6 +85,7 @@ func init() {
 	downloadOtaCmd.Flags().Bool("rsr", false, "Download Rapid Security Response OTAs")
 	downloadOtaCmd.Flags().Bool("sim", false, "Download Simulator OTAs")
 	downloadOtaCmd.Flags().BoolP("kernel", "k", false, "Extract kernelcache from remote OTA zip")
+	downloadOtaCmd.Flags().Bool("any-kernel", false, "Match any kernelcache variant (default: only kernelcache.release.*)")
 	downloadOtaCmd.Flags().Bool("dyld", false, "Extract dyld_shared_cache(s) from remote OTA zip")
 	downloadOtaCmd.Flags().BoolP("urls", "u", false, "Dump URLs only")
 	downloadOtaCmd.Flags().BoolP("json", "j", false, "Dump URLs as JSON only")
@@ -130,6 +131,7 @@ func init() {
 	viper.BindPFlag("download.ota.dyld-arch", downloadOtaCmd.Flags().Lookup("dyld-arch"))
 	viper.BindPFlag("download.ota.driver-kit", downloadOtaCmd.Flags().Lookup("driver-kit"))
 	viper.BindPFlag("download.ota.kernel", downloadOtaCmd.Flags().Lookup("kernel"))
+	viper.BindPFlag("download.ota.any-kernel", downloadOtaCmd.Flags().Lookup("any-kernel"))
 	viper.BindPFlag("download.ota.pattern", downloadOtaCmd.Flags().Lookup("pattern"))
 	viper.BindPFlag("download.ota.flat", downloadOtaCmd.Flags().Lookup("flat"))
 	viper.BindPFlag("download.ota.fcs-keys", downloadOtaCmd.Flags().Lookup("fcs-keys"))
@@ -191,6 +193,7 @@ var downloadOtaCmd = &cobra.Command{
 		dyldArches := viper.GetStringSlice("download.ota.dyld-arch")
 		dyldDriverKit := viper.GetBool("download.ota.driver-kit")
 		remoteKernel := viper.GetBool("download.ota.kernel")
+		anyKernel := viper.GetBool("download.ota.any-kernel")
 		remotePattern := viper.GetString("download.ota.pattern")
 		flat := viper.GetBool("download.ota.flat")
 		fcsKeys := viper.GetBool("download.ota.fcs-keys")
@@ -517,15 +520,90 @@ var downloadOtaCmd = &cobra.Command{
 						Encrypted:    o.IsEncrypted,
 						AEAKey:       o.ArchiveDecryptionKey,
 						Output:       destPath,
+						Build:        o.Build,
+						Version:      o.OSVersion,
+						RemoveCommas: removeCommas,
+						FwType:       "ota",
+						AnyKernel:    anyKernel,
 					}
 
-					// check if AEA encryption
-					isAEA, err := extract.IsAEA(config)
-					if err != nil {
-						return err
-					} else if isAEA {
-						log.Warn("This OTA is AEA encrypted and is NOT supported for remote extraction (yet 🤞)")
-						return nil
+					// For AEA OTAs the kernelcache path streams directly from
+					// the remote source and tees the bytes into a `.download`
+					// partial. We want that partial to live where `download
+					// ota` NORMAL MODE expects it, so it can later be resumed
+					// by the same `ipsw download ota ...` invocation (without
+					// `--kernel`). Compute that exact destName here and feed
+					// it back to the extractor.
+					if remoteKernel && (o.IsEncrypted || len(o.ArchiveDecryptionKey) > 0) {
+						otaURL := o.BaseURL + o.RelativePath
+						folder := fmt.Sprintf("%s%s_OTAs", o.ProductSystemName, strings.TrimPrefix(o.OSVersion, "9.9."))
+						if getSim {
+							folder = fmt.Sprintf("%s_%s_Simulator_OTAs", strings.ToUpper(platform), o.SimulatorVersion)
+						}
+						var devices string
+						if len(o.SupportedDevices) > 0 {
+							sorted := append([]string{}, o.SupportedDevices...)
+							sort.Strings(sorted)
+							if len(sorted) > 5 {
+								devices = fmt.Sprintf("%s_and_%d_others", sorted[0], len(sorted)-1)
+							} else {
+								devices = strings.Join(sorted, "_")
+							}
+						} else {
+							sorted := append([]string{}, o.SupportedDeviceModels...)
+							sort.Strings(sorted)
+							if len(sorted) > 5 {
+								devices = fmt.Sprintf("%s_and_%d_others", sorted[0], len(sorted)-1)
+							} else {
+								devices = strings.Join(sorted, "_")
+							}
+						}
+						var isRSR string
+						if o.SplatOnly {
+							isRSR = fmt.Sprintf("%s_%s_%s_RSR_", o.OSVersion, o.ProductVersionExtra, o.Build)
+						}
+						var isAEA string
+						if o.IsEncrypted || len(o.ArchiveDecryptionKey) > 0 {
+							filesafe := o.ArchiveDecryptionKey
+							filesafe = strings.ReplaceAll(filesafe, "/", "_")
+							filesafe = strings.ReplaceAll(filesafe, "+", "-")
+							isAEA = "KEY_[" + filesafe + "]_"
+						}
+						destName := filepath.Join(folder, fmt.Sprintf("%s_%s%s%s", devices, isRSR, isAEA, getDestName(otaURL, removeCommas)))
+						if getSim {
+							destName = filepath.Join(folder, fmt.Sprintf("simulator_%s%s", isAEA, getDestName(otaURL, removeCommas)))
+						}
+						config.AEADestName = destName
+						resumeParts := []string{
+							"ipsw download ota",
+							fmt.Sprintf("--platform %s", platform),
+							fmt.Sprintf("--device %q", device),
+							fmt.Sprintf("--version %q", strings.TrimPrefix(o.OSVersion, "9.9.")),
+							fmt.Sprintf("--build %q", o.Build),
+							fmt.Sprintf("--output %q", destPath),
+							"--resume-all",
+							"-y",
+						}
+						if removeCommas {
+							resumeParts = append(resumeParts, "--remove-commas")
+						}
+						if getSim {
+							resumeParts = append(resumeParts, "--sim")
+						}
+						config.AEAResumeCommand = strings.Join(resumeParts, " ")
+					}
+
+					// AEA OTAs are handled by the streaming branch inside
+					// extract.Kernelcache. For pattern matching and dyld_shared_cache
+					// we still don't support remote AEA extraction.
+					if len(remotePattern) > 0 || remoteDyld {
+						isAEA, err := extract.IsAEA(config)
+						if err != nil {
+							return err
+						} else if isAEA {
+							log.Warn("This OTA is AEA encrypted and pattern/dyld extraction is NOT supported for remote extraction (yet 🤞)")
+							return nil
+						}
 					}
 
 					if remoteKernel {

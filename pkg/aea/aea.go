@@ -231,47 +231,69 @@ func (md Metadata) DecryptFCS(pemData []byte, pemDB string, proxy string, insecu
 }
 
 func Info(in string) (Metadata, error) {
-	var metadata Metadata
 	f, err := os.Open(in)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	md, _, _, err := InfoFromReader(f)
+	return md, err
+}
 
+// InfoFromReader reads the AEA header + auth (metadata) section from r.
+// On success it has consumed exactly binary.Size(Header)+hdr.AuthDataLength
+// bytes from r, leaving the salt / encrypted root header / clusters available
+// for downstream streaming consumers.
+//
+// The returned authData slice is the raw bytes of the auth section (needed by
+// streaming decryption to compute the root header HMAC salt).
+func InfoFromReader(r io.Reader) (Metadata, Header, []byte, error) {
 	var hdr Header
-	if err := binary.Read(f, binary.LittleEndian, &hdr); err != nil {
-		return nil, err
+	if err := binary.Read(r, binary.LittleEndian, &hdr); err != nil {
+		return nil, hdr, nil, fmt.Errorf("failed to read AEA header: %w", err)
 	}
-
 	if string(hdr.Magic[:]) != "AEA1" {
-		return nil, fmt.Errorf("invalid AEA header: found '%s' expected 'AEA1'", string(hdr.Magic[:]))
+		return nil, hdr, nil, fmt.Errorf("invalid AEA header: found %q expected %q", string(hdr.Magic[:]), "AEA1")
 	}
 
-	metadata = make(map[string][]byte)
-	mdr := io.NewSectionReader(f, int64(binary.Size(hdr)), int64(hdr.AuthDataLength))
+	authData := make([]byte, hdr.AuthDataLength)
+	if _, err := io.ReadFull(r, authData); err != nil {
+		return nil, hdr, nil, fmt.Errorf("failed to read AEA auth data: %w", err)
+	}
 
-	// parse key-value pairs
+	md, err := parseAuthData(authData)
+	if err != nil {
+		return nil, hdr, authData, err
+	}
+	return md, hdr, authData, nil
+}
+
+// parseAuthData parses the AEA authenticated metadata section into a Metadata
+// map. The section is a sequence of (uint32 length-including-itself, key\0value)
+// records.
+func parseAuthData(authData []byte) (Metadata, error) {
+	md := make(Metadata)
+	r := bytes.NewReader(authData)
 	for {
 		var length uint32
-		err := binary.Read(mdr, binary.LittleEndian, &length)
-		if err != nil {
-			if err == io.EOF {
+		if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return nil, err
 		}
-
+		if length < uint32(binary.Size(length)) {
+			return nil, fmt.Errorf("invalid auth-data record length: %d", length)
+		}
 		keyval := make([]byte, length-uint32(binary.Size(length)))
-		if _, err = mdr.Read(keyval); err != nil {
-			if err == io.EOF {
+		if _, err := io.ReadFull(r, keyval); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return nil, err
 		}
-
 		k, v, _ := bytes.Cut(keyval, []byte{0x00})
-		metadata[string(k)] = v
+		md[string(k)] = v
 	}
-
-	return metadata, nil
+	return md, nil
 }
