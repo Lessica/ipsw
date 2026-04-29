@@ -71,7 +71,8 @@ func init() {
 		return supportedFWs, cobra.ShellCompDirectiveDefault
 	})
 	downloadAppledbCmd.Flags().Bool("kernel", false, "Extract kernelcache from remote IPSW")
-	downloadAppledbCmd.Flags().Bool("any-kernel", false, "Match any kernelcache variant (default: only kernelcache.release.*)")
+	downloadAppledbCmd.Flags().Bool("kernel-any", false, "Match any kernelcache variant (default: only kernelcache.release.*)")
+	downloadAppledbCmd.Flags().Bool("kernel-fast", false, "Use HTTP-Range random access into AEA OTA to extract kernelcache (no .download partial)")
 	downloadAppledbCmd.Flags().Bool("dyld", false, "Extract dyld_shared_cache(s) from remote OTA")
 	downloadAppledbCmd.Flags().String("pattern", "", "Download remote files that match regex")
 	downloadAppledbCmd.Flags().Bool("fcs-keys", false, "Download AEA1 DMG fcs-key pem files")
@@ -107,7 +108,8 @@ func init() {
 	viper.BindPFlag("download.appledb.os", downloadAppledbCmd.Flags().Lookup("os"))
 	viper.BindPFlag("download.appledb.type", downloadAppledbCmd.Flags().Lookup("type"))
 	viper.BindPFlag("download.appledb.kernel", downloadAppledbCmd.Flags().Lookup("kernel"))
-	viper.BindPFlag("download.appledb.any-kernel", downloadAppledbCmd.Flags().Lookup("any-kernel"))
+	viper.BindPFlag("download.appledb.kernel-any", downloadAppledbCmd.Flags().Lookup("kernel-any"))
+	viper.BindPFlag("download.appledb.kernel-fast", downloadAppledbCmd.Flags().Lookup("kernel-fast"))
 	viper.BindPFlag("download.appledb.dyld", downloadAppledbCmd.Flags().Lookup("dyld"))
 	viper.BindPFlag("download.appledb.pattern", downloadAppledbCmd.Flags().Lookup("pattern"))
 	viper.BindPFlag("download.appledb.fcs-keys", downloadAppledbCmd.Flags().Lookup("fcs-keys"))
@@ -169,7 +171,8 @@ var downloadAppledbCmd = &cobra.Command{
 		osTypes := viper.GetStringSlice("download.appledb.os")
 		fwType := viper.GetString("download.appledb.type")
 		kernel := viper.GetBool("download.appledb.kernel")
-		anyKernel := viper.GetBool("download.appledb.any-kernel")
+		anyKernel := viper.GetBool("download.appledb.kernel-any")
+		fastKernel := viper.GetBool("download.appledb.kernel-fast")
 		dyld := viper.GetBool("download.appledb.dyld")
 		pattern := viper.GetString("download.appledb.pattern")
 		fcsKeys := viper.GetBool("download.appledb.fcs-keys")
@@ -427,19 +430,20 @@ var downloadAppledbCmd = &cobra.Command{
 					}
 
 					config := &extract.Config{
-						URL:          url,
-						Pattern:      pattern,
-						Proxy:        proxy,
-						Insecure:     insecure,
-						KernelDevice: device,
-						Flatten:      flat,
-						Progress:     true,
-						Output:       output,
-						Build:        build,
-						Version:      version,
-						RemoveCommas: removeCommas,
-						FwType:       fwType,
-						AnyKernel:    anyKernel,
+						URL:           url,
+						Pattern:       pattern,
+						Proxy:         proxy,
+						Insecure:      insecure,
+						KernelDevice:  device,
+						Flatten:       flat,
+						Progress:      true,
+						Output:        output,
+						Build:         build,
+						Version:       version,
+						RemoveCommas:  removeCommas,
+						FwType:        fwType,
+						AnyKernel:     anyKernel,
+						AEAFastKernel: fastKernel,
 					}
 
 					// REMOTE KERNEL MODE

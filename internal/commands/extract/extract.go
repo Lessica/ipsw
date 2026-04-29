@@ -119,6 +119,17 @@ type Config struct {
 	// AEAResumeCommand, if set, overrides the copy-pasteable command shown
 	// to the user after a partial AEA OTA is saved.
 	AEAResumeCommand string `json:"aea_resume_command,omitempty"`
+	// AEAFastKernel, when true, uses HTTP-Range driven random access into
+	// the AEA container to fetch only the cipher segments overlapping the
+	// kernelcache YAA frame. This trades the ability to seed a `.download`
+	// resume partial for a roughly 10× reduction in transferred bytes.
+	// Currently assumes the kernelcache lives in chunk
+	// AEAFastKernelChunk (default 4) of the OTA's YOP_MANIFEST.
+	AEAFastKernel bool `json:"aea_fast_kernel,omitempty"`
+	// AEAFastKernelChunk is the YOP_MANIFEST chunk index where the
+	// kernelcache is expected to live when AEAFastKernel is enabled.
+	// Defaults to 4 if zero.
+	AEAFastKernelChunk int `json:"aea_fast_kernel_chunk,omitempty"`
 
 	info     *info.Info
 	wikiKeys download.WikiFWKeys
@@ -539,6 +550,13 @@ func Kernelcache(c *Config) (map[string][]string, error) {
 			return nil, fmt.Errorf("failed to probe remote URL: %v", err)
 		}
 		if isAEA {
+			if c.AEAFastKernel {
+				if out, err := streamRemoteAEAKernelcacheRanged(ctx, c); err == nil {
+					return out, nil
+				} else {
+					log.WithError(err).Warn("Fast Range path failed, falling back to streaming AEA decrypt")
+				}
+			}
 			return streamRemoteAEAKernelcache(ctx, cancel, c)
 		}
 		i, zr, folder, err := getRemoteFolder(c)

@@ -85,7 +85,8 @@ func init() {
 	downloadOtaCmd.Flags().Bool("rsr", false, "Download Rapid Security Response OTAs")
 	downloadOtaCmd.Flags().Bool("sim", false, "Download Simulator OTAs")
 	downloadOtaCmd.Flags().BoolP("kernel", "k", false, "Extract kernelcache from remote OTA zip")
-	downloadOtaCmd.Flags().Bool("any-kernel", false, "Match any kernelcache variant (default: only kernelcache.release.*)")
+	downloadOtaCmd.Flags().Bool("kernel-any", false, "Match any kernelcache variant (default: only kernelcache.release.*)")
+	downloadOtaCmd.Flags().Bool("kernel-fast", false, "Use HTTP-Range random access into AEA OTA to extract kernelcache (no .download partial)")
 	downloadOtaCmd.Flags().Bool("dyld", false, "Extract dyld_shared_cache(s) from remote OTA zip")
 	downloadOtaCmd.Flags().BoolP("urls", "u", false, "Dump URLs only")
 	downloadOtaCmd.Flags().BoolP("json", "j", false, "Dump URLs as JSON only")
@@ -131,7 +132,8 @@ func init() {
 	viper.BindPFlag("download.ota.dyld-arch", downloadOtaCmd.Flags().Lookup("dyld-arch"))
 	viper.BindPFlag("download.ota.driver-kit", downloadOtaCmd.Flags().Lookup("driver-kit"))
 	viper.BindPFlag("download.ota.kernel", downloadOtaCmd.Flags().Lookup("kernel"))
-	viper.BindPFlag("download.ota.any-kernel", downloadOtaCmd.Flags().Lookup("any-kernel"))
+	viper.BindPFlag("download.ota.kernel-any", downloadOtaCmd.Flags().Lookup("kernel-any"))
+	viper.BindPFlag("download.ota.kernel-fast", downloadOtaCmd.Flags().Lookup("kernel-fast"))
 	viper.BindPFlag("download.ota.pattern", downloadOtaCmd.Flags().Lookup("pattern"))
 	viper.BindPFlag("download.ota.flat", downloadOtaCmd.Flags().Lookup("flat"))
 	viper.BindPFlag("download.ota.fcs-keys", downloadOtaCmd.Flags().Lookup("fcs-keys"))
@@ -193,7 +195,8 @@ var downloadOtaCmd = &cobra.Command{
 		dyldArches := viper.GetStringSlice("download.ota.dyld-arch")
 		dyldDriverKit := viper.GetBool("download.ota.driver-kit")
 		remoteKernel := viper.GetBool("download.ota.kernel")
-		anyKernel := viper.GetBool("download.ota.any-kernel")
+		anyKernel := viper.GetBool("download.ota.kernel-any")
+		fastKernel := viper.GetBool("download.ota.kernel-fast")
 		remotePattern := viper.GetString("download.ota.pattern")
 		flat := viper.GetBool("download.ota.flat")
 		fcsKeys := viper.GetBool("download.ota.fcs-keys")
@@ -508,23 +511,24 @@ var downloadOtaCmd = &cobra.Command{
 					log.WithFields(fields).Info(fmt.Sprintf("Getting %s remote OTA", o.DocumentationID))
 
 					config := &extract.Config{
-						URL:          o.BaseURL + o.RelativePath,
-						Pattern:      remotePattern,
-						Proxy:        proxy,
-						Insecure:     insecure,
-						Arches:       dyldArches,
-						DriverKit:    dyldDriverKit,
-						KernelDevice: device,
-						Flatten:      flat,
-						Progress:     true,
-						Encrypted:    o.IsEncrypted,
-						AEAKey:       o.ArchiveDecryptionKey,
-						Output:       destPath,
-						Build:        o.Build,
-						Version:      o.OSVersion,
-						RemoveCommas: removeCommas,
-						FwType:       "ota",
-						AnyKernel:    anyKernel,
+						URL:           o.BaseURL + o.RelativePath,
+						Pattern:       remotePattern,
+						Proxy:         proxy,
+						Insecure:      insecure,
+						Arches:        dyldArches,
+						DriverKit:     dyldDriverKit,
+						KernelDevice:  device,
+						Flatten:       flat,
+						Progress:      true,
+						Encrypted:     o.IsEncrypted,
+						AEAKey:        o.ArchiveDecryptionKey,
+						Output:        destPath,
+						Build:         o.Build,
+						Version:       o.OSVersion,
+						RemoveCommas:  removeCommas,
+						FwType:        "ota",
+						AnyKernel:     anyKernel,
+						AEAFastKernel: fastKernel,
 					}
 
 					// For AEA OTAs the kernelcache path streams directly from
